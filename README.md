@@ -23,8 +23,17 @@ sleep-disorder-prediction/
 │   ├── label_encoder.pkl         ← Target LabelEncoder
 │   ├── cat_encoders.pkl          ← Categorical encoders
 │   └── feature_names.pkl         ← Feature column order
+├── capture/
+│   └── watch_capture.db          ← Live BLE data stored here (auto-created)
 ├── app/
-│   └── app.py                    ← Streamlit Web App
+│   ├── app.py                    ← Streamlit Web App
+│   ├── smartwatch_import.py      ← Real watch data parser (schema-discovering)
+│   └── ble_watch.py              ← Live BLE client (Fireboltt 046 / Da Fit)
+├── scripts/
+│   ├── ble_capture.py            ← CLI: scan / info / live / sync / features / predict
+│   ├── extract_watch_data.py     ← CLI: parse watch data without the UI
+│   ├── test_ble_capture.py       ← Mocked-GATT BLE protocol tests
+│   └── test_watch_pipeline.py    ← Synthetic end-to-end parser test
 ├── report/
 │   ├── eda_plots.png
 │   ├── correlation_heatmap.png
@@ -68,6 +77,88 @@ cd app
 streamlit run app.py
 ```
 Open your browser at: http://localhost:8501
+
+---
+
+## ⌚ Using Real Data From Your GOBOULT Fit Smartwatch
+
+The **⌚ Smartwatch Data** tab replaces the manual slider inputs with **real data**
+from your watch. There are two ways to feed it live data:
+
+1. **Directly over Bluetooth (recommended)** — the laptop's BLE adapter talks to
+   a **Fireboltt 046 / Da Fit** watch (Moyoung protocol) in real time: live
+   HR / SpO₂ / blood-pressure + last-night sleep and step history, stored in
+   `capture/watch_capture.db`. The model then predicts straight from that DB —
+   no file transfer or phone needed.
+2. **By uploading files** — the GOBOULT Fit app has no export button, so the app
+   also reads raw databases directly.
+
+### ⚡ Direct watch → prediction (Bluetooth)
+
+```bash
+python scripts/ble_capture.py scan          # find the watch, note its MAC
+python scripts/ble_capture.py predict --addr <MAC> \
+    --gender Male --age 30 --occupation "Software Engineer" --bmi Normal
+```
+
+`predict` connects, runs an optional quick live-vitals session (`--live 60` for
+HR/SpO₂/BP), syncs the last 2 nights of sleep + steps + HR history, and prints
+the disorder prediction with per-class probabilities. Personal fields the watch
+can't read (`Gender`, `Age`, `Occupation`, `BMI Category`) are passed as flags;
+any health feature the watch hasn't captured yet falls back to the dataset
+median instead of a meaningless 0.
+
+Other CLI commands:
+
+```bash
+python scripts/ble_capture.py info  --addr <MAC>      # battery, firmware, steps
+python scripts/ble_capture.py live  --addr <MAC> --seconds 90
+python scripts/ble_capture.py sync  --addr <MAC>      # sleep + steps + HR history
+python scripts/ble_capture.py features                # features from --db
+python scripts/ble_capture.py predict --gender ...    # predict from an existing --db
+```
+
+The same flow is available in the app under **⌚ Smartwatch Data → 🔴 Live capture**:
+scan → connect → Start live capture → **🌙 Sync last 2 days** → click
+**🔍 Run Sleep Disorder Prediction from Watch Data**.
+
+### Data sources (pick any)
+
+| Source | How to get it | Notes |
+|--------|---------------|-------|
+| **Live Bluetooth (laptop)** | `ble_capture.py scan` / **⌚ Smartwatch Data** tab | Fireboltt 046 / Da Fit, Moyoung protocol. No phone needed. |
+| **Health Connect zip** | Android 14+: Settings → Health Connect → Manage data → Export (or a daily schedule to Google Drive) | Works if GOBOULT Fit / other apps write to Health Connect. |
+| **GOBOULT Fit / Crrepa `.db`** | Copy the app's databases off the phone (`adb` / root — see below) | The app introspects the schema, so `steps`, `heart_rate`, `sleep`, `spo2`, `bloodpressure`, `stress` tables are auto-detected regardless of firmware naming. |
+| **CSV** | Export anything with step / sleep / HR columns | Simple fallback for testing. |
+
+### Pulling GOBOULT Fit's database via adb (root / backup)
+
+```bash
+adb root                          # on a rooted device
+adb shell "cat /data/data/com.crrepa.band.boultfit/databases/*.db" > goboult.db
+# OR older Androids (≤11):
+adb backup -noapk com.crrepa.band.boultfit -f goboult.ab
+# then unpack the .ab (skip 24-byte header, zlib-decompress) into a .db/tar
+```
+Upload the resulting `.zip` / `.db` files in the **⌚ Smartwatch Data** tab.
+
+### Test parsing without the UI
+
+```bash
+python scripts/extract_watch_data.py export.zip --window 7
+python scripts/extract_watch_data.py goboult.db --json
+python scripts/test_watch_pipeline.py     # synthetic end-to-end check
+python scripts/test_ble_capture.py       # mocked-GATT BLE protocol check
+```
+
+### How it works
+
+`app/smartwatch_import.py` introspects the SQLite schema (table + column names
+vary by firmware) and matches steps / sleep / heart rate / SpO2 / blood pressure /
+stress tables by keyword heuristics. `Gender`, `Age`, `Occupation`, `BMI Category`
+are still entered manually. Any health feature the watch does not provide falls
+back to the dataset median rather than a zero value, so a partial capture still
+produces a meaningful prediction.
 
 ---
 

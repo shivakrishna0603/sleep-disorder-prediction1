@@ -19,6 +19,14 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch
 
+from smartwatch_import import (
+    load_records, extract_features, build_model_input, clamp_to_dataset, FEATURE_KEYS
+)
+from ble_watch import (
+    sync_session_available, SyncSession, scan_sync, load_records_from_db,
+    default_db_path, CaptureDB,
+)
+
 # ── Page Config ───────────────────────────────────────────────
 st.set_page_config(
     page_title="Sleep Disorder Predictor",
@@ -303,6 +311,285 @@ def build_pdf_report(input_dict_display, label, proba, classes):
     return buf
 
 
+# ============================================================
+# Shared helpers: Live BLE capture + watch-data prediction UI
+# ============================================================
+
+def _render_watch_core(feat, hf, missing, key_suffix, src_text, w_gender, w_age,
+                       w_occupation, w_bmi, window_days, sp2_val=None,
+                       has_watch_data=True):
+    """Metrics card + prediction button + result banner (shared by the
+    file-upload path and the Live BLE path)."""
+    st.markdown('<div class="card"><h4>📊 Metrics extracted from your watch</h4>',
+                unsafe_allow_html=True)
+    diag_rows = []
+    for key in FEATURE_KEYS:
+        val = hf.get(key)
+        diag_rows.append({"Feature": key, "Value": val if val is not None else "—",
+                          "Source": ""})
+    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
+
+    if missing:
+        st.warning("⚠️ The following features could not be auto-detected and are "
+                   "set to defaults in the form above: " + ", ".join(missing))
+    st.caption(src_text)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    do_predict = st.button("🔍 Run Sleep Disorder Prediction from Watch Data",
+                           use_container_width=True, key=f"w_predict_{key_suffix}")
+
+    if do_predict:
+        if not model_loaded:
+            st.error("Model not loaded — run the training script first.")
+        elif not has_watch_data:
+            st.error("No watch data captured/uploaded yet — run a BLE session or upload a file first.")
+        else:
+            input_dict_enc = {}
+            try:
+                input_dict_enc["Gender"] = int(cat_encoders["Gender"].transform([w_gender])[0])
+                input_dict_enc["Age"] = w_age
+                input_dict_enc["Occupation"] = int(cat_encoders["Occupation"].transform([w_occupation])[0])
+                input_dict_enc["BMI Category"] = int(cat_encoders["BMI Category"].transform([w_bmi])[0])
+            except Exception as enc_err:
+                st.error(f"Encoding error: {enc_err}")
+            else:
+                for k in FEATURE_KEYS:
+                    v = hf.get(k)
+                    if v is not None:
+                        input_dict_enc[k] = v
+                display_dict = {
+                    "Gender": w_gender, "Age": w_age, "Occupation": w_occupation,
+                    "BMI Category": w_bmi,
+                    **{k: hf.get(k) for k in FEATURE_KEYS if hf.get(k) is not None},
+                    "_spo2": sp2_val,
+                }
+                display_dict = {k: v for k, v in display_dict.items() if v is not None}
+
+                label, proba = encode_and_predict(input_dict_enc)
+                meta_r = RESULT_META.get(label, RESULT_META["None"])
+                confidence = max(proba) * 100
+
+                st.session_state.history.append({
+                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    **{k: v for k, v in display_dict.items() if k != "_spo2"},
+                    "Prediction": label, "Confidence": f"{confidence:.1f}%",
+                    "Source": src_text,
+                })
+
+                if label == "None":
+                    st.balloons()
+
+                st.markdown(
+                    f"""<div class="result-banner {meta_r['css']}">
+                        <div class="result-banner-emoji">{meta_r['emoji']}</div>
+                        <div class="result-banner-text">
+                            <div class="result-banner-label">{label}</div>
+                            <div class="result-banner-sub">Predicted with {confidence:.1f}% confidence — {src_text}</div>
+                        </div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f'<div class="advice-box" style="margin-top:1rem;">'
+                    f'{meta_r["emoji"]} {meta_r["advice"]}</div>',
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("<div style='margin:1.2rem 0 0.6rem'></div>", unsafe_allow_html=True)
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    st.markdown('<div class="card"><h4>🎯 Confidence</h4>',
+                                unsafe_allow_html=True)
+                    gauge = go.Figure(go.Indicator(
+                        mode="gauge+number", value=confidence,
+                        number={"suffix": "%", "font": {"color": "#23264A", "size": 40}},
+                        gauge={"axis": {"range": [0, 100], "tickcolor": "#23264A"},
+                               "bar": {"color": meta_r["color"]},
+                               "bgcolor": "rgba(35,38,74,0.06)",
+                               "borderwidth": 2, "bordercolor": "#23264A"},
+                        domain={"x": [0, 1], "y": [0, 1]},
+                    ))
+                    gauge.update_layout(height=200, margin=dict(l=20, r=20, t=10, b=10),
+                                         paper_bgcolor="rgba(0,0,0,0)", font={"color": "#23264A"})
+                    st.plotly_chart(gauge, use_container_width=True)
+                    pdf_buf = build_pdf_report(display_dict, label, proba,
+                                               list(le_target.classes_))
+                    st.download_button(
+                        "📄 Download PDF Report",
+                        data=pdf_buf,
+                        file_name=f"sleep_report_watch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with rc2:
+                    st.markdown('<div class="card"><h4>📊 Probability by Class</h4>',
+                                unsafe_allow_html=True)
+                    classes = list(le_target.classes_)
+                    colors_list = [RESULT_META.get(c, {}).get("color", "#8B7FFF")
+                                   for c in classes]
+                    bar_fig = go.Figure(go.Bar(
+                        x=proba * 100, y=classes, orientation="h",
+                        marker_color=colors_list,
+                        marker_line_color="#23264A", marker_line_width=1.5,
+                        text=[f"{v:.1f}%" for v in proba * 100],
+                        textposition="outside",
+                        textfont={"color": "#23264A", "size": 13},
+                    ))
+                    bar_fig.update_layout(
+                        xaxis_title="Probability (%)", xaxis_range=[0, 105],
+                        height=200, margin=dict(l=10, r=30, t=10, b=10),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        font={"color": "#23264A"}, showlegend=False,
+                    )
+                    st.plotly_chart(bar_fig, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+
+                csv_df = pd.DataFrame([
+                    {"Feature": k, "Value": display_dict.get(k)} for k in FEATURE_KEYS
+                ])
+                st.download_button(
+                    "⬇️ Download extracted features CSV",
+                    data=csv_df.to_csv(index=False),
+                    file_name="watch_features.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+
+def _render_ble_section():
+    """Live BLE capture from a Fireboltt 046 / Da Fit watch (laptop adapter)."""
+    if "ble_devices" not in st.session_state:
+        st.session_state.ble_devices = []
+    if "ble_summary" not in st.session_state:
+        st.session_state.ble_summary = None
+    if "ble_last" not in st.session_state:
+        st.session_state.ble_last = ""
+    if "ble_addr" not in st.session_state:
+        st.session_state.ble_addr = ""
+    if "ble_night" not in st.session_state:
+        st.session_state.ble_night = None
+
+    with st.expander("🔵 Live capture from your Fireboltt 046 (Bluetooth)", expanded=False):
+        if not sync_session_available:
+            st.warning("`bleak` is not installed — run `pip install bleak` to use live capture.")
+            return
+
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            if st.button("🔍 Scan for watch", key="ble_scan"):
+                with st.spinner("Scanning for Bluetooth watch…"):
+                    try:
+                        st.session_state.ble_devices = scan_sync(timeout=10.0)
+                        st.session_state.ble_last = (f"Found {len(st.session_state.ble_devices)} "
+                                                     f"device(s)")
+                    except Exception as e:
+                        st.session_state.ble_devices = []
+                        st.session_state.ble_last = f"Scan failed: {e}"
+        with c2:
+            if st.session_state.ble_last:
+                st.caption(st.session_state.ble_last)
+
+        addr = ""
+        if st.session_state.ble_devices:
+            dev_opts = {f"{d.name} ({d.address})  RSSI {d.rssi}"
+                        + ("  · 0xFEEA" if d.service_feea else ""): d.address
+                        for d in st.session_state.ble_devices}
+            addr = st.selectbox("Choose your watch", list(dev_opts), key="ble_choose")
+            if addr:
+                addr = dev_opts[addr]
+        manual = st.text_input("…or paste the watch's BLE MAC address", key="ble_manual")
+        addr = (addr or "").strip()
+        need_addr = addr if addr else (manual.strip() or None)
+
+        if need_addr:
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button("🔗 Connect & view info", key="ble_info"):
+                    with st.spinner("Connecting…"):
+                        try:
+                            with SyncSession(need_addr) as s:
+                                st.session_state.ble_addr = need_addr
+                                st.session_state.ble_info = s.device_info
+                                bat = s.battery()
+                                steps = s.today_steps()
+                                st.session_state.ble_battery = bat
+                                st.session_state.ble_steps = steps
+                                st.session_state.ble_proto = s.protocol
+                                st.session_state.ble_last = "Connected ✔"
+                        except Exception as e:
+                            st.session_state.ble_last = f"Connect failed: {e}"
+            with b2:
+                dur = st.slider("HR capture (s)", 10, 180, 60, key="ble_dur",
+                                help="Each measurement runs one at a time: HR first (this slider), then SpO2, then blood pressure — even if it takes longer.")
+            with b3:
+                if st.button("❤️ Start live capture", key="ble_live", disabled=st.session_state.get("ble_busy", False)):
+                    st.session_state.ble_busy = True
+                    try:
+                        samples = {}
+                        phases = []
+                        with st.spinner(f"Capturing one at a time — HR {dur}s, then SpO2, then BP — keep the watch on your wrist…"):
+                            def _on_sample(kind, v):
+                                samples[kind] = v
+                            def _on_phase(name):
+                                phases.append(name)
+                            with SyncSession(need_addr) as s:
+                                s.capture_all(hr_seconds=dur, hr_every=2.5,
+                                              on_sample=_on_sample, on_phase=_on_phase)
+                                st.session_state.ble_addr = need_addr
+                                st.session_state.ble_summary = s.db.summary()
+                                st.session_state.ble_steps = s.today_steps()
+                        order = " -> ".join(phases) if phases else "capture finished"
+                        st.session_state.ble_last = ("Capture finished" + (f" ({order})" if order else "") +
+                                                     " — latest: " +
+                                                     ", ".join(f"{k}={v}" for k, v in samples.items()))
+                    except Exception as e:
+                        st.session_state.ble_last = f"Capture failed: {e}"
+                    finally:
+                        st.session_state.ble_busy = False
+
+            if st.button("🌙 Sync last 2 days (sleep/steps/HR)", key="ble_sync"):
+                with st.spinner("Syncing from watch… keep the app open (~20-30s)"):
+                    try:
+                        night = None
+                        with SyncSession(need_addr) as s:
+                            def _prog(msg):
+                                pass
+                            night = s.sync(with_workouts=True, on_progress=_prog)
+                            st.session_state.ble_addr = need_addr
+                            st.session_state.ble_info = s.device_info
+                            st.session_state.ble_summary = s.db.summary()
+                        st.session_state.ble_night = night
+                        if night:
+                            st.session_state.ble_last = (
+                                f"Synced ✔  Last night: {night['duration_hrs']} h "
+                                f"(quality {night['quality']})")
+                        else:
+                            st.session_state.ble_last = "Synced ✔ (no sleep segments stored yet — wear it overnight)"
+                    except Exception as e:
+                        st.session_state.ble_last = f"Sync failed: {e}"
+
+        info = st.session_state.get("ble_info")
+        if info:
+            st.markdown(
+                '<div style="border:2px dashed #23264A;border-radius:14px;padding:0.6rem 1rem;'
+                'font-size:0.9rem;">'
+                f"<b>{' · '.join(v for v in info.values() if v)}</b>"
+                f"&nbsp;&nbsp;·&nbsp;&nbsp; protocol {st.session_state.get('ble_proto','')}"
+                + (f"&nbsp;&nbsp;·&nbsp;&nbsp;🔋 battery {st.session_state['ble_battery']}%"
+                   if st.session_state.get("ble_battery") else "")
+                + (f"&nbsp;&nbsp;·&nbsp;&nbsp;👣 today {st.session_state['ble_steps']} steps"
+                   if st.session_state.get("ble_steps") else "")
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+        counts = st.session_state.get("ble_summary")
+        if counts:
+            filled = {k: v for k, v in counts.items() if v}
+            st.caption("Captured so far: " + " · ".join(f"{k}={v}" for k, v in filled.items())
+                       if filled else "")
+
+
 # ── Hero Header ───────────────────────────────────────────────
 acc_str = f"{TEST_ACC * 100:.1f}%" if TEST_ACC else "N/A"
 st.markdown(
@@ -348,9 +635,101 @@ This app uses **Machine Learning** to predict sleep disorders from health & life
     st.caption("⚠️ Educational tool only — not a medical diagnosis.")
 
 # ── Tabs ──────────────────────────────────────────────────────
-tab_predict, tab_batch, tab_history, tab_insights, tab_about = st.tabs(
-    ["🔮 Predict", "📁 Batch Predict", "🕓 History", "📊 Data Insights", "ℹ️ About"]
+tab_watch, tab_predict, tab_batch, tab_history, tab_insights, tab_about = st.tabs(
+    ["⌚ Smartwatch Data", "🔮 Predict", "📁 Batch Predict", "🕓 History", "📊 Data Insights", "ℹ️ About"]
 )
+
+# =================================================================
+# SMARTWATCH DATA TAB
+# =================================================================
+with tab_watch:
+    st.markdown("#### ⌚ Real Data From Your Smartwatch")
+    st.caption(
+        "Get data from your watch two ways: "
+        "**(1)** connect it to THIS laptop over Bluetooth for live HR/SpO₂/BP + "
+        "last-night sleep sync (Fireboltt 046 / Da Fit), or "
+        "**(2)** upload a Health Connect export zip, GOBOULT Fit / Crrepa `.db` "
+        "(pulled via adb), or a CSV with step / sleep / HR columns."
+    )
+
+    # --- Live BLE section ----------------------------------------------
+    _render_ble_section()
+
+    # --- Source upload --------------------------------------------------
+    src_col, cfg_col = st.columns([3, 2])
+    with src_col:
+        watch_file = st.file_uploader(
+            "Upload Health Connect ZIP, .db / .sqlite file(s), or a CSV",
+            type=["zip", "db", "sqlite", "sqlite3", "csv"],
+            accept_multiple_files=True,
+            key="watch_file",
+        )
+    with cfg_col:
+        window_days = st.slider("Lookback window (days)", 1, 30, 7)
+
+    # --- Personal info (manual fields the watch never provides) --------
+    st.markdown('<div class="card"><h4>👤 Personal Info (you enter these)</h4>',
+                unsafe_allow_html=True)
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    with pc1:
+        w_gender = st.selectbox("Gender", GENDER_OPTIONS, key="w_gender")
+    with pc2:
+        w_age = st.slider("Age", 18, 80, 30, key="w_age")
+    with pc3:
+        w_occupation = st.selectbox("Occupation", OCCUPATION_OPTIONS, key="w_occ")
+    with pc4:
+        w_bmi = st.selectbox("BMI Category", BMI_OPTIONS, key="w_bmi")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # --- BLE captured data -> prediction --------------------------------
+    if st.session_state.get("ble_summary") is not None and st.session_state.get("ble_addr"):
+        try:
+            ble_records = load_records_from_db(default_db_path())
+            ble_feat = extract_features(ble_records, window_days=window_days)
+            ble_hf, ble_disp, ble_missing = build_model_input(
+                ble_feat, w_gender, w_age, w_occupation, w_bmi
+            )
+            tbls = ", ".join(k for k in ble_records.get("raw", {}).keys()) or "none"
+            _render_watch_core(
+                ble_feat, ble_hf, ble_missing, key_suffix="ble", src_text="Live BLE capture",
+                w_gender=w_gender, w_age=w_age, w_occupation=w_occupation, w_bmi=w_bmi,
+                window_days=window_days,
+                sp2_val=ble_feat.get("features", {}).get("_spo2"),
+                has_watch_data=sum(ble_feat["record_counts"].values()) > 0,
+            )
+            st.caption(f"Data source: `{default_db_path()}` · detected tables: {tbls}")
+        except Exception as ble_err:
+            st.warning(f"Could not build prediction from captured data yet: {ble_err}")
+
+    # --- Parse & extract from uploaded file -----------------------------
+    if watch_file:
+        sources = [f.getvalue() for f in watch_file] if isinstance(watch_file, list) else [watch_file.getvalue()]
+        try:
+            records = load_records(sources if len(sources) > 1 else sources[0])
+            feat = extract_features(records, window_days=window_days)
+            hf, display, missing = build_model_input(
+                feat, w_gender, w_age, w_occupation, w_bmi
+            )
+            src_text = "Smartwatch (real data)"
+            _render_watch_core(
+                feat, hf, missing, key_suffix="up",
+                src_text="uploaded file",
+                w_gender=w_gender, w_age=w_age, w_occupation=w_occupation, w_bmi=w_bmi,
+                window_days=window_days,
+                sp2_val=feat.get("features", {}).get("_spo2"),
+                has_watch_data=sum(feat["record_counts"].values()) > 0,
+            )
+            st.caption(f"**Sources detected:** "
+                       f"{', '.join(records.get('_filenames', [])) or 'N/A'}  ·  "
+                       f"Tables found: {', '.join(k for k in records.get('raw', {}).keys()) or 'none'}")
+        except Exception as parse_err:
+            st.error(f"Could not parse uploaded file: {parse_err}")
+    elif not st.session_state.get("ble_summary"):
+        st.info("Connect the watch below (Bluetooth) for a live session, or upload a Health "
+                "Connect export zip, GOBOULT Fit .db files, or a CSV."
+                "A single live session captures steps / heart rate / SpO₂ / BP now; "
+                "**sleep duration & quality** come from the last night you wore the watch, "
+                "fetched with **🌙 Sync last 2 days**.")
 
 # =================================================================
 # PREDICT TAB

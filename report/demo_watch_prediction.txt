@@ -1,0 +1,58 @@
+[08:58:06] ================================================================
+[08:58:06]  SLEEP DISORDER PREDICTOR - SMARTWATCH DEMO
+[08:58:06] ================================================================
+[08:58:06]  [MODEL] Gradient Boosting loaded  (test accuracy 97.3%)
+[08:58:06] 
+[08:58:06]  [1/5] Connecting to smartwatch DE:1F:D2:7E:5F:D3 over Bluetooth ...
+[08:58:06]          (keep the watch ON and near the laptop)
+[08:58:14]          manufacturer: MOYOUNG-V2
+[08:58:14]          protocol: V2
+[08:58:14] 
+[08:58:14]  [2/5] Capturing vitals one at a time (HR 35s, then SpO2, then BP, then stress) ...
+[08:58:14]          -- phase: HR --
+[08:58:43]          heart_rate    : 100
+[08:59:15]          heart_rate    : 103
+[08:59:18]          -- phase: SpO2 --
+[08:59:56]          spo2          : 99
+[08:59:56]          -- phase: BP --
+[09:00:24]          bp            : (139, 77)
+[09:00:24]          -- phase: Stress --
+[09:00:55]          steps today   : 75
+[09:00:55]          battery      : 69%
+[09:00:55] 
+[09:00:55]  [3/5] Syncing last 2 nights (sleep / step / HR history) ...
+[09:00:55]          - Syncing time…
+[09:00:57]          - Steps synced
+[09:00:59]          - Heart-rate history requested
+[09:01:29]          - Aggregating last night's sleep…
+[09:01:30]          (no sleep history on the watch yet - wear it to sleep
+[09:01:30]           for a night to capture real sleep duration)
+[09:01:30]          captured rows : heart_rate=16, steps=3, spo2=7, blood_pressure=3
+[09:01:30]          [connected & captured OK]
+[09:01:30] 
+[09:01:30]  [4/5] Extracting model features from the watch data ...
+[09:01:30]        detected tables: bp, heart_rate, raw, spo2, steps
+[09:01:30]          Sleep Duration        : 7.2  (dataset-median fallback)
+[09:01:30]          Quality of Sleep      : 7  (dataset-median fallback)
+[09:01:30]          Physical Activity Level: 30  (derived from daily steps)
+[09:01:30]          Stress Level          : 5  (dataset-median fallback)
+[09:01:30]          Heart Rate            : 90
+[09:01:30]          Daily Steps           : 1000
+[09:01:30]          Systolic_BP           : 139
+[09:01:30]          Diastolic_BP          : 77
+[09:01:30]          SpO2 (watch)          : 97
+[09:01:30] 
+[09:01:30]  [5/5] Predicting sleep disorder for profile:
+[09:01:30]          Gender=Male  Age=32  Occupation=Software Engineer  BMI=Normal
+[09:01:30] 
+[09:01:30]  RESULT
+[09:01:30] ----------------------------------------------------------------
+[09:01:30]    Insomnia       30.6%  ##############
+[09:01:30]    None            5.8%  ###
+[09:01:30]    Sleep Apnea    63.6%  [09:01:30]  Full transcript saved to: C:\mini pr\sleep-disorder-prediction\report\demo_watch_prediction.txt
+09:01:30]    >>> PREDICTION: Sleep Apnea   (confidence 63.6%)
+[09:01:30] ================================================================
+[09:01:30] 
+[09:01:30]  Signs consistent with sleep apnea were detected from the watch data.
+[09:01:30] Please consult a healthcare professional for a proper diagnosis.
+[09:01:30] 
