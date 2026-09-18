@@ -6,3 +6,6 @@ venv/
 .env
 .DS_Store
 notebooks/.ipynb_checkpoints/
+
+# Live BLE watch capture DB (contains personal health readings)
+capture/*.db

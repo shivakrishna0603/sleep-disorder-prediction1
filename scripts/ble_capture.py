@@ -6,6 +6,7 @@
 #   python scripts/ble_capture.py scan
 #   python scripts/ble_capture.py info --addr <ADDRESS>
 #   python scripts/ble_capture.py live  --addr <ADDRESS> --seconds 60
+#   python scripts/ble_capture.py stress --addr <ADDRESS>        # live stress reading (retries)
 #   python scripts/ble_capture.py sync  --addr <ADDRESS>
 # ============================================================
 
@@ -117,6 +118,42 @@ async def _run_sync(address, db_path):
         db.close()
 
 
+async def _run_stress(address, db_path, attempts, timeout):
+    db = CaptureDB(db_path)
+    client = MoyoungClient(address, db)
+    try:
+        await client.connect()
+        info = client.device_info
+        print(f"Connected to {address}  protocol={client.protocol}  mtu={client.mtu}")
+        for k, v in info.items():
+            if v:
+                print(f"  {k}: {v}")
+        await client.sync_time()
+
+        def on_attempt(i, n):
+            print(f"  stress attempt {i}/{n} ...", flush=True)
+
+        print(f"Measuring stress (up to {attempts} attempts, ~{timeout}s each)...")
+        val = await client.measure_stress_with_retry(
+            attempts=attempts, timeout=timeout, on_attempt=on_attempt)
+        if val is None:
+            last = db.latest_stress()
+            if last:
+                when = time.strftime('%H:%M', time.localtime(last["ts"]))
+                print(f"  watch ignored on-demand stress; last stored value = "
+                      f"{last['value']} (at {when})")
+            else:
+                print("  no stress value captured (watch ignored on-demand stress).")
+        else:
+            await db.add_stress(time.time(), int(val))
+            print(f"  ✅ live stress: {val}")
+        print("\nRow counts:", db.summary())
+        print(f"\nDB: {db_path}")
+    finally:
+        await client.close()
+        db.close()
+
+
 def _load_model():
     model_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
     import pickle
@@ -221,6 +258,12 @@ def main():
     p_live.add_argument("--seconds", type=int, default=60)
     p_live.add_argument("--hr-every", type=float, default=3.0)
     p_sync = sub.add_parser("sync", parents=[common], help="sync sleep/steps/HR history")
+    p_stress = sub.add_parser("stress", parents=[common],
+                              help="measure a live stress reading (with retries)")
+    p_stress.add_argument("--attempts", type=int, default=3,
+                          help="on-demand stress probes before giving up")
+    p_stress.add_argument("--timeout", type=float, default=20.0,
+                          help="seconds to wait per attempt")
     p_feat = sub.add_parser("features",
                             help="extract model features from a capture DB")
     p_feat.add_argument("--db", default=None,
@@ -246,7 +289,7 @@ def main():
     args = ap.parse_args()
     db_path = getattr(args, "db", None) or default_db_path()
 
-    needs_ble = args.cmd in ("scan", "info", "live", "sync") or \
+    needs_ble = args.cmd in ("scan", "info", "live", "sync", "stress") or \
         (args.cmd == "predict" and bool(args.addr))
     if not BLEAK_AVAILABLE and needs_ble:
         print("bleak is not installed. Run:  pip install bleak")
@@ -294,6 +337,9 @@ def main():
             loop.run_until_complete(_run_live(args.addr, args.seconds, db_path, args.hr_every))
         elif args.cmd == "sync":
             loop.run_until_complete(_run_sync(args.addr, db_path))
+        elif args.cmd == "stress":
+            loop.run_until_complete(_run_stress(args.addr, db_path,
+                                                args.attempts, args.timeout))
         elif args.cmd == "predict":
             loop.run_until_complete(_run_predict(args, db_path))
     finally:

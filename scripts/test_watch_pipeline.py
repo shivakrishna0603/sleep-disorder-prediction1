@@ -20,7 +20,9 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
-from smartwatch_import import load_records, extract_features, build_model_input, FEATURE_KEYS
+from smartwatch_import import (
+    load_records, extract_features, build_model_input, FEATURE_KEYS, NORMAL_RANGES,
+)
 
 
 def _make_hc_zip_bytes(days=7):
@@ -237,6 +239,17 @@ def test():
     hf, display, missing = build_model_input(feat, "Male", 30, "Software Engineer", "Normal")
     assert all(k in hf for k in FEATURE_KEYS), "missing model keys"
     print(f"  PASSED: model input has all 12 keys, missing={missing}")
+
+    raw = feat["features"]
+    preserved = True
+    for k in FEATURE_KEYS:
+        if raw.get(k) is not None and hf.get(k) != raw.get(k):
+            # Sleep Duration is re-rounded to 1 decimal by build_model_input
+            if not (k == "Sleep Duration" and abs(hf[k] - raw[k]) < 0.06):
+                preserved = False
+                print(f"      changed: {k} raw={raw[k]} -> {hf[k]}")
+    assert preserved, "present watch fields must be kept unchanged"
+    print("  PASSED: present watch fields preserved from the watch")
     print()
 
     print("=" * 60)
@@ -255,6 +268,29 @@ def test():
     assert hf2["Daily Steps"] is not None, "steps value missing"
     assert hf2["Heart Rate"] is not None, "heart rate missing"
     print(f"  PASSED: features from Crrepa DB: { {k: v for k, v in hf2.items() if v is not None} }")
+    print()
+
+    print("=" * 60)
+    print("  TEST 3: normal-range fallback for missing fields")
+    print("=" * 60)
+    empty_features = {"features": {k: None for k in FEATURE_KEYS}}
+    hf3, _, missing3 = build_model_input(empty_features, "Male", 30,
+                                         "Software Engineer", "Normal")
+    assert len(missing3) == len(FEATURE_KEYS), f"expected all {len(FEATURE_KEYS)} missing"
+    within = True
+    for k, (lo, hi) in NORMAL_RANGES.items():
+        v = hf3.get(k)
+        if v is None or not (lo <= v <= hi):
+            within = False
+            print(f"      out of range: {k}={v} outside {lo}-{hi}")
+        if k == "Sleep Duration":
+            if v is not None and round(v, 1) != v:
+                within = False
+        elif v is not None and v != int(v):
+            within = False
+    assert within, "fallback values must sit inside NORMAL_RANGES with correct rounding"
+    print(f"  PASSED: all {len(NORMAL_RANGES)} missing fields sampled inside NORMAL_RANGES")
+    print(f"          sampled = {hf3}")
     print()
 
     print("=" * 60)

@@ -15,6 +15,7 @@
 
 import io
 import os
+import random
 import sqlite3
 import tempfile
 import zipfile
@@ -634,13 +635,26 @@ MAX_RANGE = {
     "Systolic_BP": 180, "Diastolic_BP": 120,
 }
 
-# Dataset medians (sleep_health.csv) — used as sane fallbacks when the
-# watch does not supply a feature, instead of feeding 0 into the model.
-DEFAULT_VALUES = {
-    "Sleep Duration": 7.2, "Quality of Sleep": 7.0, "Physical Activity Level": 60.0,
-    "Stress Level": 5.0, "Heart Rate": 70.0, "Daily Steps": 7000.0,
-    "Systolic_BP": 130.0, "Diastolic_BP": 85.0,
+# Normal (healthy) ranges used when the watch does not provide a feature.
+# A value is sampled uniformly inside the band so the model sees realistic
+# "normal" inputs instead of a single fixed median.
+NORMAL_RANGES = {
+    "Sleep Duration": (4.0, 7.0),
+    "Quality of Sleep": (6, 9),
+    "Physical Activity Level": (30, 90),
+    "Stress Level": (3, 8),
+    "Heart Rate": (60, 80),
+    "Daily Steps": (5000, 10000),
+    "Systolic_BP": (115, 135),
+    "Diastolic_BP": (75, 90),
 }
+
+
+def normal_fallback(feature):
+    """Sample a random 'normal' value inside the feature's healthy range."""
+    lo, hi = NORMAL_RANGES.get(
+        feature, (MIN_RANGE.get(feature, 0), MAX_RANGE.get(feature, 10)))
+    return random.uniform(lo, hi)
 
 
 def clamp_to_dataset(feature, value):
@@ -666,7 +680,7 @@ def build_model_input(health_features, gender, age, occupation, bmi):
               "Stress Level", "Heart Rate", "Daily Steps", "Systolic_BP", "Diastolic_BP"):
         v = clamp_to_dataset(k, hf.get(k)) if hf.get(k) is not None else None
         if v is None:
-            v = DEFAULT_VALUES[k]      # watch doesn't provide it -> dataset median
+            v = normal_fallback(k)   # watch doesn't provide it -> random normal value
             missing.append(k)
         auto[k] = round(v, 1) if k == "Sleep Duration" else int(round(v))
 

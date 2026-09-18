@@ -207,6 +207,72 @@ def test_streamed_measure_buffer():
         loop.close()
 
 
+def test_measure_stress_retry():
+    print("=" * 60)
+    print("  TEST: on-demand stress retry logic")
+    print("=" * 60)
+    import asyncio
+
+    async def run():
+        db = CaptureDB(":memory:")
+        c = MoyoungClient("AA:BB:CC:DD:EE:FF", db, mtu_override=508)
+        attempts = []
+
+        async def fake_ok(timeout=40.0):
+            attempts.append(timeout)
+            return 36 if len(attempts) >= 2 else None
+
+        c.measure_stress = fake_ok
+        val = await c.measure_stress_with_retry(attempts=3, timeout=0.1)
+        check("stress retry returns value on 2nd probe", val == 36, f"got {val}")
+        check("stress probes stop after success", len(attempts) == 2,
+              f"probed {len(attempts)}")
+        attempts.clear()
+
+        async def fake_fail(timeout=40.0):
+            attempts.append(timeout)
+            return None
+
+        c.measure_stress = fake_fail
+        val2 = await c.measure_stress_with_retry(attempts=3, timeout=0.05)
+        check("stress all-fail returns None", val2 is None, f"got {val2}")
+        check("stress all-fail tries all attempts", len(attempts) == 3,
+              f"probed {len(attempts)}")
+        db.close()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(run())
+    finally:
+        loop.close()
+
+
+def test_latest_stress():
+    print("=" * 60)
+    print("  TEST: CaptureDB.latest_stress fallback")
+    print("=" * 60)
+    import asyncio
+    import time as _time
+    db = CaptureDB(":memory:")
+    try:
+        now = int(_time.time())
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(db.add_stress(now - 2000, 21))
+            loop.run_until_complete(db.add_stress(now, 38))
+            loop.run_until_complete(db.add_stress(now - 1000, 25))
+        finally:
+            loop.close()
+        latest = db.latest_stress(max_age_days=7)
+        check("latest stress returns newest row",
+              latest is not None and latest["value"] == 38 and latest["ts"] == now,
+              f"got {latest}")
+        old = db.latest_stress(max_age_days=-0.01)
+        check("latest stress respects window", old is None, f"got {old}")
+    finally:
+        db.close()
+
+
 def test_db_round_trip():
     print("=" * 60)
     print("  TEST: CaptureDB -> smartwatch_import -> features")
@@ -281,6 +347,8 @@ def test():
     test_decode_hr_grid()
     test_workout_details()
     test_name_match()
+    test_measure_stress_retry()
+    test_latest_stress()
     test_db_round_trip()
 
     print("=" * 60)

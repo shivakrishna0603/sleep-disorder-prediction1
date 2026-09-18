@@ -469,6 +469,8 @@ def _render_ble_section():
         st.session_state.ble_addr = ""
     if "ble_night" not in st.session_state:
         st.session_state.ble_night = None
+    if "ble_stress" not in st.session_state:
+        st.session_state.ble_stress = None
 
     with st.expander("🔵 Live capture from your Fireboltt 046 (Bluetooth)", expanded=False):
         if not sync_session_available:
@@ -569,6 +571,29 @@ def _render_ble_section():
                     except Exception as e:
                         st.session_state.ble_last = f"Sync failed: {e}"
 
+            if st.button("🧠 Measure stress now (3 tries, ~1 min)",
+                         key="ble_stress",
+                         disabled=st.session_state.get("ble_busy", False)):
+                st.session_state.ble_busy = True
+                try:
+                    with st.spinner("Measuring stress from the watch — keep it on your wrist…"):
+                        val = source = None
+                        with SyncSession(need_addr) as s:
+                            val, source = s.measure_stress(attempts=3)
+                            st.session_state.ble_addr = need_addr
+                            st.session_state.ble_summary = s.db.summary()
+                    if val is not None:
+                        st.session_state.ble_stress = (val, source)
+                        st.session_state.ble_last = f"Stress: {val} ({source})"
+                    else:
+                        st.session_state.ble_stress = None
+                        st.session_state.ble_last = ("Stress not available — the watch ignored "
+                                                     "on-demand stress and no stored value was found.")
+                except Exception as e:
+                    st.session_state.ble_last = f"Stress failed: {e}"
+                finally:
+                    st.session_state.ble_busy = False
+
         info = st.session_state.get("ble_info")
         if info:
             st.markdown(
@@ -580,6 +605,10 @@ def _render_ble_section():
                    if st.session_state.get("ble_battery") else "")
                 + (f"&nbsp;&nbsp;·&nbsp;&nbsp;👣 today {st.session_state['ble_steps']} steps"
                    if st.session_state.get("ble_steps") else "")
+                + (f"&nbsp;&nbsp;·&nbsp;&nbsp;🧠 stress {st.session_state['ble_stress'][0]} "
+                   f"({st.session_state['ble_stress'][1]})"
+                   if st.session_state.get("ble_stress")
+                   and st.session_state["ble_stress"][0] is not None else "")
                 + "</div>",
                 unsafe_allow_html=True,
             )

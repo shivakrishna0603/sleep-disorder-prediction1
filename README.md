@@ -113,6 +113,7 @@ Other CLI commands:
 ```bash
 python scripts/ble_capture.py info  --addr <MAC>      # battery, firmware, steps
 python scripts/ble_capture.py live  --addr <MAC> --seconds 90
+python scripts/ble_capture.py stress --addr <MAC>      # live stress reading (retries + stored fallback)
 python scripts/ble_capture.py sync  --addr <MAC>      # sleep + steps + HR history
 python scripts/ble_capture.py features                # features from --db
 python scripts/ble_capture.py predict --gender ...    # predict from an existing --db

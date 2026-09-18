@@ -363,6 +363,22 @@ class CaptureDB:
                 out[tbl] = 0
         return out
 
+    def latest_stress(self, max_age_days: float = 7.0):
+        """Most recent stored stress value within the window.
+
+        Used as a live fallback: when the watch ignores on-demand stress we
+        still have the last value it recorded. Returns a dict
+        {'ts': epoch_secs, 'value': int} or None."""
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT time, value FROM stress "
+            "WHERE value IS NOT NULL AND time >= ? "
+            "ORDER BY time DESC LIMIT 1",
+            (int(time.time()) - int(max_age_days * 86400),)).fetchone()
+        if not row:
+            return None
+        return {"ts": int(row[0]), "value": int(row[1])}
+
 
 def _estimate_wake_time(rows):
     """Guess wake-up time from ordered sleep-stage markers.
@@ -706,6 +722,28 @@ class MoyoungClient:
         return await self._await_live(CMD_ADVANCED_QUERY, b"\x11\x00\x00",
                                       timeout)
 
+    async def measure_stress_with_retry(self, attempts: int = 3,
+                                        timeout: float = 20.0,
+                                        on_attempt=None) -> Optional[int]:
+        """Probe on-demand stress up to `attempts` times.
+
+        Many watches ignore the first on-demand stress trigger and only answer
+        a later one, so instead of one long unresponsive wait we send several
+        shorter probes and keep the first valid reading. Returns None when the
+        watch never answers (caller may fall back to stored history)."""
+        for i in range(1, attempts + 1):
+            if on_attempt:
+                try:
+                    on_attempt(i, attempts)
+                except Exception:
+                    pass
+            val = await self.measure_stress(timeout=timeout)
+            if val is not None:
+                return val
+            if i < attempts:
+                await asyncio.sleep(1.0)
+        return None
+
     async def live_session(self, seconds: float, on_sample=None,
                            hr_every: float = 8.0, spo2_every: float = 30.0,
                            bp_every: float = 60.0, stop_event=None):
@@ -751,8 +789,8 @@ class MoyoungClient:
     async def capture_sequential(self, *, hr_seconds: float = 30.0,
                                  hr_every: float = 5.0, do_hr: bool = True,
                                  do_spo2: bool = True, do_bp: bool = True,
-                                 do_stress: bool = True, on_sample=None,
-                                 on_phase=None, stop_event=None):
+                                 do_stress: bool = True, stress_attempts: int = 3,
+                                 on_sample=None, on_phase=None, stop_event=None):
         """Capture each watch measurement ONE AFTER ANOTHER to completion:
         HR first, then SpO2, then BP, then stress. The single sensor runs
         each to its full measurement window, so this takes longer but never
@@ -801,14 +839,22 @@ class MoyoungClient:
             if val is not None:
                 await self.db.add_bp(time.time(), int(val[0]), int(val[1]))
                 submit("bp", (int(val[0]), int(val[1])))
-        # PHASE 4 - stress reading (many watches ignore on-demand stress,
-        # so it is one quick attempt - no long retry when unsupported)
+        # PHASE 4 - stress reading. Many watches ignore on-demand stress, so
+        # re-trigger it a few times instead of one long unresponsive wait.
         if do_stress:
             phase("Stress")
-            val = await self.measure_stress(timeout=30.0)
-            if val is not None:
-                await self.db.add_stress(time.time(), int(val))
-                submit("stress", int(val))
+            for attempt in range(1, stress_attempts + 1):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if attempt > 1:
+                    phase(f"Stress attempt {attempt}/{stress_attempts}")
+                val = await self.measure_stress(timeout=20.0)
+                if val is not None:
+                    await self.db.add_stress(time.time(), int(val))
+                    submit("stress", int(val))
+                    break
+                if attempt < stress_attempts:
+                    await asyncio.sleep(1.0)
 
     # ---- sync ----------------------------------------------------------
     async def sync_history(self, with_workouts: bool = True,
@@ -853,8 +899,9 @@ class MoyoungClient:
 
             if with_workouts:
                 await self.send_command(CMD_QUERY_V2_WORKOUT, b"\x00")
-            await self.send_command(CMD_ADVANCED_QUERY, b"\x11\x03\x00")
-            await self.send_command(CMD_ADVANCED_QUERY, b"\x11\x03\x01")
+            for day in range(3):
+                await self.send_command(CMD_ADVANCED_QUERY, bytes([0x11, 0x03, day]))
+                await asyncio.sleep(0.1)
 
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
@@ -1103,18 +1150,47 @@ class SyncSession:
 
     def capture_all(self, hr_seconds: float = 30.0, hr_every: float = 5.0,
                     do_spo2: bool = True, do_bp: bool = True,
-                    do_stress: bool = True, on_sample=None, on_phase=None,
+                    do_stress: bool = True, stress_attempts: int = 3,
+                    on_sample=None, on_phase=None,
                     stop_event=None, timeout: Optional[float] = None):
         """One measurement after another: HR, SpO2, BP, stress - even if
-        that takes longer, nothing gets interleaved on the single sensor."""
-        budget = timeout or (hr_seconds + 240.0)
+        that takes longer, nothing gets interleaved on the single sensor.
+        Stress is re-triggered up to `stress_attempts` times."""
+        budget = timeout or (hr_seconds + 360.0)
         self.loop.run_until_complete(
             asyncio.wait_for(
                 self.client.capture_sequential(
                     hr_seconds=hr_seconds, hr_every=hr_every, do_spo2=do_spo2,
                     do_bp=do_bp, do_stress=do_stress,
+                    stress_attempts=stress_attempts,
                     on_sample=on_sample, on_phase=on_phase, stop_event=stop_event),
                 timeout=budget))
+
+    def measure_stress(self, attempts: int = 3, timeout: float = 20.0,
+                       on_attempt=None, store: bool = True):
+        """Focused live stress reading with retries.
+
+        Returns (value, source):
+          - (int, 'live')            fresh on-demand measurement succeeded
+          - (int, 'last stored HH:MM') watch ignored on-demand stress but a
+                                      recent row exists in the capture DB
+          - (None, None)             nothing available at all
+        """
+        if not self.client:
+            return None, None
+        val = self.loop.run_until_complete(
+            self.client.measure_stress_with_retry(attempts=attempts,
+                                                  timeout=timeout,
+                                                  on_attempt=on_attempt))
+        if val is not None:
+            if store:
+                self.loop.run_until_complete(self.db.add_stress(time.time(), val))
+            return int(val), "live"
+        last = self.db.latest_stress()
+        if last:
+            when = datetime.fromtimestamp(last["ts"]).strftime("%H:%M")
+            return last["value"], f"last stored {when}"
+        return None, None
 
     def sync(self, with_workouts: bool = True, on_progress=None,
              timeout: Optional[float] = 120.0):
