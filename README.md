@@ -78,6 +78,20 @@ streamlit run app.py
 ```
 Open your browser at: http://localhost:8501
 
+### 🌐 Deploy to the web (Streamlit Community Cloud) — free
+
+1. Push this repo to GitHub.
+2. Go to https://share.streamlit.io and sign in with GitHub.
+3. Click **Create app** → **From existing repo** and pick
+   `shivakrishna0603/sleep-disorder-prediction1`.
+4. Branch `main`, **Main file path** `app/app.py`, click **Deploy**.
+5. Your app goes live at
+   `https://<github-user>-sleep-disorder-prediction1.streamlit.app`.
+
+> ℹ️ **Note:** BLE live capture needs the laptop's Bluetooth adapter, so it is
+> disabled in the cloud. Manual entry, CSV/batch prediction, PDF reports, and
+> watch-file upload (Health Connect zip / GOBOULT `.db`) all still work.
+
 ---
 
 ## ⌚ Using Real Data From Your GOBOULT Fit Smartwatch
